@@ -1,0 +1,177 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#include <drm/drm_fourcc.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <sys/mman.h>
+#include <string.h>
+
+#define WIDTH  640
+#define HEIGHT 480
+
+int drm_fd;
+drmModeModeInfo mode;
+uint32_t fb;
+uint32_t handle;
+struct drm_mode_create_dumb create;
+struct drm_mode_map_dumb map;
+void *map_addr;
+drmModeCrtc *crtc;
+EGLDisplay egl_display;
+EGLContext egl_context;
+EGLSurface egl_surface;
+
+// Function to initialize DRM
+void init_drm() {
+    // Open the DRM device
+    drm_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    if (drm_fd < 0) {
+        perror("open");
+        exit(EXIT_FAILURE);
+    }
+
+    // Get DRM resources
+    drmModeRes *resources = drmModeGetResources(drm_fd);
+    if (!resources) {
+        perror("drmModeGetResources");
+        close(drm_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // Find a connected connector
+    drmModeConnector *connector = NULL;
+    for (int i = 0; i < resources->count_connectors; i++) {
+        connector = drmModeGetConnector(drm_fd, resources->connectors[i]);
+        if (connector->connection == DRM_MODE_CONNECTED) {
+            break;
+        }
+        drmModeFreeConnector(connector);
+        connector = NULL;
+    }
+    if (!connector) {
+        fprintf(stderr, "No connected connector found\n");
+        drmModeFreeResources(resources);
+        close(drm_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // Get the encoder and CRTC
+    drmModeEncoder *encoder = drmModeGetEncoder(drm_fd, connector->encoder_id);
+    crtc = drmModeGetCrtc(drm_fd, encoder->crtc_id);
+
+    // Choose the first mode
+    mode = connector->modes[0];
+
+    // Create a dumb buffer
+    memset(&create, 0, sizeof(create));
+    create.width = WIDTH;
+    create.height = HEIGHT;
+    create.bpp = 32;
+    drmIoctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &create);
+
+    // Create a framebuffer object for the dumb buffer
+    drmModeAddFB(drm_fd, WIDTH, HEIGHT, 24, 32, create.pitch, create.handle, &fb);
+    handle = create.handle;
+
+    // Prepare the dumb buffer for memory mapping
+    memset(&map, 0, sizeof(map));
+    map.handle = create.handle;
+    drmIoctl(drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &map);
+
+    // Map the buffer to user space
+    map_addr = mmap(0, create.size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, map.offset);
+    if (map_addr == MAP_FAILED) {
+        perror("mmap");
+        close(drm_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // Set the CRTC
+    drmModeSetCrtc(drm_fd, crtc->crtc_id, fb, 0, 0, &connector->connector_id, 1, &mode);
+
+    drmModeFreeEncoder(encoder);
+    drmModeFreeConnector(connector);
+    drmModeFreeResources(resources);
+}
+
+// Function to initialize EGL
+void init_egl() {
+    // Get the EGL display
+    egl_display = eglGetDisplay((EGLNativeDisplayType) drm_fd);
+    eglInitialize(egl_display, NULL, NULL);
+
+    // Choose an EGL config
+    static const EGLint config_attribs[] = {
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_NONE
+    };
+    EGLConfig egl_config;
+    EGLint num_configs;
+    eglChooseConfig(egl_display, config_attribs, &egl_config, 1, &num_configs);
+
+    // Create an EGL context
+    static const EGLint context_attribs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_NONE
+    };
+    egl_context = eglCreateContext(egl_display, egl_config, EGL_NO_CONTEXT, context_attribs);
+
+    // Create an EGL window surface
+    static const EGLint surface_attribs[] = {
+        EGL_WIDTH, WIDTH,
+        EGL_HEIGHT, HEIGHT,
+        EGL_NONE
+    };
+    egl_surface = eglCreateWindowSurface(egl_display, egl_config, (EGLNativeWindowType)fb, surface_attribs);
+    eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context);
+}
+
+// Function to render a frame using OpenGL ES
+void render() {
+    glClearColor(0.0, 0.0, 1.0, 1.0); // Blue color
+    glClear(GL_COLOR_BUFFER_BIT);
+}
+
+// Function to swap buffers
+void swap_buffers() {
+    eglSwapBuffers(egl_display, egl_surface);
+}
+
+int main(int argc, char **argv) {
+    // Initialize DRM and EGL
+    init_drm();
+    init_egl();
+
+    // Rendering loop
+    while (1) {
+        render();
+        swap_buffers();
+        usleep(16000); // ~60 FPS
+    }
+
+    // Clean up resources
+    munmap(map_addr, create.size);
+    drmModeRmFB(drm_fd, fb);
+    struct drm_mode_destroy_dumb destroy = { .handle = handle };
+    drmIoctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
+
+    eglDestroyContext(egl_display, egl_context);
+    eglDestroySurface(egl_display, egl_surface);
+    eglTerminate(egl_display);
+
+    drmModeSetCrtc(drm_fd, crtc->crtc_id, crtc->buffer_id, crtc->x, crtc->y, &crtc->connector_id, 1, &crtc->mode);
+
+    drmModeFreeCrtc(crtc);
+    close(drm_fd);
+    return 0;
+}
